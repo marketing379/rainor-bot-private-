@@ -1,0 +1,5 @@
+python-telegram-bot==21.10
+apscheduler==3.10.4
+web3==7.15.0
+openai==1.75.0
+httpx==0.28.1
