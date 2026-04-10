@@ -1,0 +1,150 @@
+# Rain Protocol SDK Documentation - Knowledge Base
+
+Source: https://rain.one/docs/For-Developers/Rain-Builders
+
+## Overview
+
+The Rain SDK provides TypeScript tools to interact with the Rain Protocol on Arbitrum One. You can use it to build, sign, and send transactions for creating new markets, trading options, and claiming winnings. The SDK is designed specifically for AI coding assistants. Your AI agent can read provided files, understand transaction patterns, and write integration code.
+
+Whether you're building a custom frontend, routing trades for users, or launching specialized pools, the SDK handles the technical execution. By integrating Rain, you plug directly into the automated market maker (AMM) liquidity for logic-based forecasts.
+
+## RNG Layer
+
+For high-speed applications, you can tap into the RNG Layer. This system uses verifiable randomness through Chainlink VRF to power mathematically-driven risk scenarios. Instead of using individual pools required for standard prediction markets, the RNG Layer draws from a single shared liquidity pool, giving users instant settlement for fast-paced, random markets.
+
+## Account Abstraction
+
+The SDK includes an account abstraction module. This lets you manage smart accounts and sponsor gas fees, so users can trade without worrying about network costs.
+
+## Builder Program
+
+The Builder Program supports platforms that drive volume or create unique markets. You bring the users and the SDK provides the on-chain infrastructure.
+
+## What You Can Build
+
+### Permissionless Market Creation
+Launch public or private markets on any verifiable event. You define the options, set the resolution rules, and provide the initial liquidity in a single transaction. Rain is open for anyone to build on, so you never need approval to start a new pool.
+
+### Trading & Liquidity
+Construct interfaces for users to buy and sell outcome shares against the market's liquidity pool. Users can also supply liquidity to specific markets. Liquidity providers earn a 1.2% fee from the trading volume their specific pool generates.
+
+### Gas-Sponsored Execution
+Route transactions through the RainAA module. Rain uses Alchemy smart accounts to cover gas costs. Users can trade and interact with the protocol without needing to hold native ETH in their wallets.
+
+### Live Data Streams
+Connect to WebSockets to pull live AMM pricing, order history, and market resolution events directly to your front end. This keeps your application in sync with the blockchain without constantly polling for updates.
+
+## SDK Architecture: The Two Pillars
+
+The SDK is split into two independent classes: Rain (stateless) and RainAA (stateful).
+
+### The Execution Flow
+1. Your Application: The user interacts with your custom frontend.
+2. The Rain Class: Your application calls a method here to build an action. All transaction builders return an unsigned RawTransaction containing the to, data, and optional value fields.
+3. The RainAA Class: You pass that RawTransaction into this module. It manages the Alchemy smart accounts and signs the transaction via account abstraction, covering the network fees.
+4. Arbitrum One: The transaction settles on-chain, interacting with Diamond Proxy pools and the specific AMM for that option.
+
+### The Rain Class (Stateless)
+Rain operates without state. It fetches data, builds unsigned transactions, and subscribes to events. It does not require a connected wallet. You use this class to query the protocol and construct actions. Because it returns a standard RawTransaction, you retain the freedom to decide how to execute it, whether you use RainAA, wagmi, ethers, or another custom provider.
+
+### The RainAA Class (Stateful Execution)
+RainAA maintains state. It handles the mechanics of account abstraction. Once your stateless class generates the transaction data, you pass it here. This module takes care of the execution. It sponsors gas costs so users do not need native ETH to trade.
+
+## Quick Start
+
+### Installation
+```
+npm install @buidlrrr/rain-sdk
+npm install viem@^2.0.0  # Required peer dependency
+```
+
+### Your First Trade Flow
+
+1. Initialize (no wallet needed):
+```typescript
+const rain = new Rain({ environment: 'development' });
+```
+
+2. Fetch Markets:
+```typescript
+const markets = await rain.getPublicMarkets({ limit: 10 });
+```
+
+3. Build a Buy Transaction:
+```typescript
+const rawTx = rain.buildBuyOptionRawTx({
+  marketContractAddress: '0x...',
+  selectedOption: 1n,
+  buyAmountInWei: 10_000_000n,  // 10 USDT (Arbitrum USDT uses 6 decimals)
+});
+```
+
+4. Execute:
+```typescript
+await yourProvider.sendTransaction(rawTx);
+```
+
+## Creating a Market
+
+One of the core features of building on Rain is permissionless market creation. You do not need approval to start a new pool. If an event has a verifiable outcome, you can build a market around it using the SDK.
+
+### Public vs. Private Markets
+- Public Markets: Open to anyone, great for sports, politics, or global events. Can be resolved by AI oracle or market creator.
+- Private Markets: Designed for specific groups, require a secret access code to join. Creator acts as resolver.
+
+### Building the Transaction
+```typescript
+import { Rain } from '@rainprotocolsdk/sdk';
+
+const rain = new Rain({ environment: 'production' });
+
+const txs = await rain.buildCreateMarketTx({
+  marketQuestion: 'Will BTC hit 100k?',
+  marketOptions: ['Yes', 'No'],
+  marketTags: ['crypto', 'bitcoin'],
+  marketDescription: 'Prediction market for BTC price',
+  isPublic: true,
+  isPublicPoolResolverAi: false,
+  creator: '0x996ea23940f4a01610181D04bdB6F862719b63f0',
+  startTime: 1770836400n,
+  endTime: 1770922800n,
+  no_of_options: 2n,
+  inputAmountWei: 100_000_000n,   // 100 USDT (min 10 tokens)
+  barValues: [50, 50],
+  baseToken: '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9',
+  tokenDecimals: 6,
+});
+
+for (const tx of txs) {
+  await rainAA.sendTransaction(tx);
+}
+```
+
+### Parameters Explained
+- Text Fields: marketQuestion, marketDescription, marketTags define market appearance
+- Options: marketOptions is array of outcomes, no_of_options is numerical count
+- Permissions: isPublic determines open/restricted, isPublicPoolResolverAi for AI resolution
+- Timing: startTime and endTime are Unix timestamps
+- Liquidity & Tokens: inputAmountWei is initial funding (min $10), baseToken is currency address, tokenDecimals for math
+- Initial Odds: barValues sets starting probability distribution as percentages
+
+### Managing the Market Lifecycle
+- buildCloseMarketTx(params): Close market and halt trading
+- buildChooseWinnerTx(params): Submit winning outcome
+- buildResolveMarketTx(params): Finalize market state (returns array of RawTransaction[])
+
+## Essential Links
+- GitHub Repository: https://github.com/rain1-labs/rain-sdk
+- NPM Package: https://www.npmjs.com/package/@buidlrrr/rain-sdk
+- Documentation: https://rain.one/docs/For-Developers/Rain-Builders
+
+## Additional SDK Topics (from navigation)
+- Trading & Positions: Buy/sell options, read portfolios
+- Liquidity: Supply and manage liquidity
+- Account Abstraction: Manage Alchemy smart accounts, connect users, send transactions
+- WebSockets & Live Data: Subscribe to market events, stream live AMM pricing
+- Analytics & History: Historical data and analytics
+- Environments & Configuration: Setup for different environments
+- API Reference: Full API documentation
+- Rain for AI Agents: Built for AI agents, OpenClaw Skills, example prompts
+- RNG Layer: Verifiable randomness, Chainlink VRF, shared liquidity pool

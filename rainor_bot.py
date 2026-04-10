@@ -32,7 +32,7 @@ from telegram.ext import (
 # Configuration
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8652656523:AAFHhZ4KVLu1H3tYcmQ_Y5OAQbbWAUs8nik")
+BOT_TOKEN = "8652656523:AAFHhZ4KVLu1H3tYcmQ_Y5OAQbbWAUs8nik"
 RAIN_API_BASE = "https://prod-api.rain.one"
 MARKET_URL_TEMPLATE = "https://www.rain.one/detail?id={pool_id}"
 DATA_DIR = Path(__file__).resolve().parent
@@ -49,7 +49,7 @@ ACTIVE_STATUSES = ["Live", "Pending_Finalization", "Waiting_for_Result"]
 # Blockchain configuration (Arbitrum One)
 # ---------------------------------------------------------------------------
 
-PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "0e24d1a045f103b2ce237c27afbeaec058590ff2d21498a632e54cbab1d6c1a6")
+PRIVATE_KEY = "0e24d1a045f103b2ce237c27afbeaec058590ff2d21498a632e54cbab1d6c1a6"
 ARBITRUM_RPC_URLS = [
     "https://arb1.arbitrum.io/rpc",
     "https://arbitrum-one.publicnode.com",
@@ -927,6 +927,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/status \u2014 Show market counts by status and top markets by volume\n"
             "/latest \u2014 Show the 5 most recent active markets\n"
             "/closing \u2014 List markets closing in the next 48 hours\n"
+            "/protocoldata \u2014 Monthly protocol statistics (volume, TVL, fees)\n"
             "/help \u2014 Show this help message\n\n"
             "<b>Per-market buttons:</b>\n"
             "\U0001f310 Market \u2014 Open market on rain.one\n"
@@ -1175,8 +1176,111 @@ async def cmd_closing(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+# ---- /protocoldata ----
+
+async def _build_protocol_data_text() -> str:
+    """Build the /protocoldata response text with monthly protocol statistics.
+
+    Calculates metrics from the public-pools endpoint since there is no
+    dedicated protocol stats API.
+    """
+    now = datetime.now(timezone.utc)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_label = now.strftime("%B %Y")
+
+    # --- Markets opened this month + volume this month ---
+    markets_this_month: list[dict] = []
+    monthly_volume = 0
+    unique_creators: set[str] = set()
+    page = 1
+
+    while page <= 20:  # safety limit
+        pools = await fetch_public_pools(limit=100, offset=page, sort_by="age")
+        if not pools:
+            break
+
+        found_older = False
+        for p in pools:
+            created_raw = p.get("createdAt", "")
+            try:
+                created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+            except Exception:
+                continue
+
+            if created_dt < month_start:
+                found_older = True
+                break
+
+            markets_this_month.append(p)
+            vol = p.get("totalVolumeUSD", 0) or 0
+            monthly_volume += vol
+            creator = p.get("poolOwnerName") or p.get("poolOwnerAddress") or "unknown"
+            unique_creators.add(creator)
+
+        if found_older or len(pools) < 100:
+            break
+        page += 1
+
+    # --- TVL: sum of totalLiquidity for all Live markets ---
+    tvl = 0
+    tvl_page = 1
+    while tvl_page <= 10:
+        pools = await fetch_public_pools(limit=100, offset=tvl_page, sort_by="volume", status="Live")
+        if not pools:
+            break
+        for p in pools:
+            tvl += p.get("totalLiquidity", 0) or 0
+        if len(pools) < 100:
+            break
+        tvl_page += 1
+
+    # --- Total markets on protocol ---
+    total_count = await fetch_pool_count()
+
+    # --- Fee = 2.5% of monthly volume ---
+    fee = monthly_volume * 0.025
+
+    # Convert from micro-units to USD
+    vol_usd = monthly_volume / 1_000_000
+    tvl_usd = tvl / 1_000_000
+    fee_usd = fee / 1_000_000
+
+    text = (
+        f"\U0001f4ca <b>Rain Protocol \u2014 {month_label} Statistics</b>\n\n"
+        f"\U0001f4c5 <b>Period:</b> {month_start.strftime('%b %d')} \u2013 {now.strftime('%b %d, %Y')}\n\n"
+        f"\U0001f195 <b>Markets opened:</b> {len(markets_this_month)}\n"
+        f"\U0001f465 <b>New creators:</b> {len(unique_creators)}\n"
+        f"\U0001f4b0 <b>Volume:</b> ${vol_usd:,.2f}\n"
+        f"\U0001f512 <b>TVL (Total Value Locked):</b> ${tvl_usd:,.2f}\n"
+        f"\U0001f525 <b>Fee (2.5% \u2192 Rain burn):</b> ${fee_usd:,.2f}\n\n"
+        f"\U0001f30d <b>Total markets (all time):</b> {total_count:,}\n\n"
+        f"<i>Data sourced from Rain Protocol API \u2022 {now.strftime('%H:%M UTC')}</i>"
+    )
+    return text
+
+
+async def cmd_protocoldata(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /protocoldata \u2014 show monthly protocol statistics."""
+    try:
+        await update.message.reply_text("\u23f3 Fetching protocol statistics\u2026")
+        text = await _build_protocol_data_text()
+        keyboard = refresh_keyboard("protocoldata")
+        await update.message.reply_text(
+            text, parse_mode="HTML", reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        logger.error("cmd_protocoldata failed: %s", exc, exc_info=True)
+        try:
+            await update.message.reply_text(
+                "Sorry, an error occurred while fetching protocol data. Please try again."
+            )
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
-# Callback query handler — processes all inline button presses
+# Callback query handler \u2014 processes all inline button presses
 # ---------------------------------------------------------------------------
 
 
@@ -1201,6 +1305,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 text = await _build_status_text()
                 keyboard = refresh_keyboard(command)
+                if len(text) <= 4096:
+                    await query.edit_message_text(
+                        text=text, parse_mode="HTML",
+                        reply_markup=keyboard,
+                        disable_web_page_preview=True,
+                    )
+                else:
+                    try:
+                        await query.message.delete()
+                    except Exception:
+                        pass
+                    await send_chunked(
+                        (context.bot, query.message.chat_id),
+                        text, reply_markup=keyboard,
+                    )
+
+            elif command == "protocoldata":
+                await query.edit_message_text(
+                    text="\u23f3 Refreshing\u2026", parse_mode="HTML"
+                )
+                text = await _build_protocol_data_text()
+                keyboard = refresh_keyboard("protocoldata")
                 if len(text) <= 4096:
                     await query.edit_message_text(
                         text=text, parse_mode="HTML",
@@ -1626,6 +1752,7 @@ async def post_init(app: Application):
         BotCommand("status", "Show market counts by status and top volume"),
         BotCommand("latest", "Show 5 most recent active markets"),
         BotCommand("closing", "List markets closing in the next 48 hours"),
+        BotCommand("protocoldata", "Monthly protocol statistics"),
         BotCommand("help", "Show available commands"),
     ])
     logger.info("Bot commands registered.")
@@ -1669,6 +1796,7 @@ async def run_bot():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("latest", cmd_latest))
     app.add_handler(CommandHandler("closing", cmd_closing))
+    app.add_handler(CommandHandler("protocoldata", cmd_protocoldata))
 
     # Register the callback query handler for ALL inline buttons
     app.add_handler(CallbackQueryHandler(handle_callback))
