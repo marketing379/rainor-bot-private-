@@ -1238,8 +1238,8 @@ def _protocoldata_keyboard(active_range: str = "month") -> InlineKeyboardMarkup:
     """
     ranges = [
         ("24h", "24 Hours"),
+        ("7d", "7 Days"),
         ("30d", "30 Days"),
-        ("month", "Current Month"),
         ("all", "All Time"),
     ]
     buttons = []
@@ -1257,9 +1257,10 @@ def _protocoldata_keyboard(active_range: str = "month") -> InlineKeyboardMarkup:
 async def _build_protocol_data_text(time_range: str = "month") -> str:
     """Build the /protocoldata response text for the given time range.
 
-    Supported ranges: '24h', '30d', 'month', 'all'.
+    Supported ranges: '24h', '7d', '30d', 'all'.
+    Default view is current calendar month.
     Uses DefiLlama API for TVL, Volume, and Fees (authoritative on-chain data).
-    Uses Rain Protocol API for market counts and unique creators.
+    Uses Rain Protocol API for market counts.
     """
     now = datetime.now(timezone.utc)
 
@@ -1268,6 +1269,10 @@ async def _build_protocol_data_text(time_range: str = "month") -> str:
         cutoff = now - timedelta(hours=24)
         period_label = "Last 24 Hours"
         period_range = f"{cutoff.strftime('%b %d %H:%M')} \u2013 {now.strftime('%b %d %H:%M UTC')}"
+    elif time_range == "7d":
+        cutoff = now - timedelta(days=7)
+        period_label = "Last 7 Days"
+        period_range = f"{cutoff.strftime('%b %d')} \u2013 {now.strftime('%b %d, %Y')}"
     elif time_range == "30d":
         cutoff = now - timedelta(days=30)
         period_label = "Last 30 Days"
@@ -1276,14 +1281,13 @@ async def _build_protocol_data_text(time_range: str = "month") -> str:
         cutoff = None
         period_label = "All Time"
         period_range = f"Since inception \u2013 {now.strftime('%b %d, %Y')}"
-    else:  # "month"
+    else:  # "month" — current calendar month (default)
         cutoff = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         period_label = now.strftime("%B %Y")
         period_range = f"{cutoff.strftime('%b %d')} \u2013 {now.strftime('%b %d, %Y')}"
 
     # --- Collect markets in the time range (from Rain API) ---
     matched_markets: list[dict] = []
-    unique_creators: set[str] = set()
     page = 1
 
     while page <= 20:
@@ -1301,79 +1305,69 @@ async def _build_protocol_data_text(time_range: str = "month") -> str:
                 found_older = True
                 break
             matched_markets.append(p)
-            creator = p.get("poolOwnerName") or p.get("poolOwnerAddress") or "unknown"
-            unique_creators.add(creator)
         if found_older or len(pools) < 100:
             break
         page += 1
 
     # --- Total markets on protocol (always all-time, from Rain API) ---
-    # Use the dedicated /pools/get-all-pools-count endpoint for accuracy
     total_count = await fetch_all_pools_count()
     if total_count == 0:
-        # Fallback to the old method if the new endpoint fails
         total_count = await fetch_pool_count()
 
     # --- Total registered users (all-time, from Rain API) ---
     total_users = await fetch_total_users()
 
     # --- Fetch TVL, Volume, and Fees from DefiLlama API ---
-    # DefiLlama reads directly from Arbitrum on-chain data (pool contract balances
-    # and EnterOption/Claim events), which is more accurate than the Rain REST API
-    # whose totalLiquidity/totalVolumeUSD fields only reflect partial internal metrics.
     dl_tvl = 0.0
     dl_volume = 0.0
     dl_fees = 0.0
-    dl_source_note = "DefiLlama (on-chain) + Rain Protocol API"
-    dl_available = False
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as dl_client:
-            # TVL: current on-chain snapshot (always the live figure regardless of time range)
+            # TVL: current on-chain snapshot (always live, regardless of time range)
             tvl_resp = await dl_client.get("https://api.llama.fi/tvl/rain")
             if tvl_resp.status_code == 200:
                 dl_tvl = float(tvl_resp.json())
-                dl_available = True
 
-            # Volume: from DefiLlama DEX dimension adapter
-            # Fields: total24h, total7d, total30d, totalAllTime
+            # Volume: from DefiLlama DEX adapter
             vol_resp = await dl_client.get("https://api.llama.fi/summary/dexs/rain")
             if vol_resp.status_code == 200:
                 vol_data = vol_resp.json()
                 if time_range == "24h":
                     dl_volume = float(vol_data.get("total24h") or 0)
+                elif time_range == "7d":
+                    dl_volume = float(vol_data.get("total7d") or 0)
                 elif time_range == "30d":
                     dl_volume = float(vol_data.get("total30d") or 0)
                 elif time_range == "all":
                     dl_volume = float(vol_data.get("totalAllTime") or 0)
-                else:  # "month" — DefiLlama has no calendar-month bucket; use 30d
+                else:  # "month"
                     dl_volume = float(vol_data.get("total30d") or 0)
 
-            # Fees: from DefiLlama fees dimension adapter
-            # Fields: total24h, total7d, total30d, totalAllTime
+            # Fees: from DefiLlama fees adapter
             fees_resp = await dl_client.get("https://api.llama.fi/summary/fees/rain")
             if fees_resp.status_code == 200:
                 fees_data = fees_resp.json()
                 if time_range == "24h":
                     dl_fees = float(fees_data.get("total24h") or 0)
+                elif time_range == "7d":
+                    dl_fees = float(fees_data.get("total7d") or 0)
                 elif time_range == "30d":
                     dl_fees = float(fees_data.get("total30d") or 0)
                 elif time_range == "all":
                     dl_fees = float(fees_data.get("totalAllTime") or 0)
-                else:
+                else:  # "month"
                     dl_fees = float(fees_data.get("total30d") or 0)
     except Exception as exc:
         logger.warning("DefiLlama API error in /protocoldata: %s", exc)
-        dl_source_note = "Rain Protocol API (DefiLlama unavailable)"
 
-    # Fees fallback: if DefiLlama fees endpoint returned 0 but volume is available,
-    # estimate fees as 2.5% of volume (Rain Protocol's stated fee rate)
+    # Fees fallback: estimate as 2.5% of volume if DefiLlama fees returned 0
     fee_usd = dl_fees if dl_fees > 0 else dl_volume * 0.025
 
-    # Volume note for "month" range (DefiLlama uses rolling 30d, not calendar month)
+    # Volume label note for "month" range
     vol_note = " (rolling 30d)" if time_range == "month" else ""
 
-    # Users line: only show for "all" range since it's always all-time
+    # Users line: always show total users (it's always all-time)
     users_line = ""
     if total_users > 0:
         users_line = f"\U0001f464 <b>Total users (all time):</b> {total_users:,}\n"
@@ -1383,14 +1377,13 @@ async def _build_protocol_data_text(time_range: str = "month") -> str:
         f"\U0001f4ca <b>Rain Protocol \u2014 {period_label}</b>\n\n"
         f"\U0001f4c5 <b>Period:</b> {period_range}\n\n"
         f"\U0001f195 <b>Markets opened:</b> {len(matched_markets)}\n"
-        f"\U0001f465 <b>Unique creators:</b> {len(unique_creators)}\n"
-        f"\U0001f4b0 <b>Volume{vol_note}:</b> ${dl_volume:,.2f}\n"
-        f"\U0001f512 <b>TVL (current):</b> ${dl_tvl:,.2f}\n"
-        f"\U0001f525 <b>Fees{vol_note} (\u2192 Rain burn):</b> ${fee_usd:,.2f}\n\n"
+        f"\U0001f4b0 <b>Volume{vol_note}:</b> ${dl_volume:,.0f}\n"
+        f"\U0001f512 <b>TVL (current):</b> ${dl_tvl:,.0f}\n"
+        f"\U0001f525 <b>Fees{vol_note} (\u2192 Rain burn):</b> ${fee_usd:,.0f}\n\n"
         f"{users_line}"
         f"\U0001f30d <b>Total markets (all time):</b> {total_count:,}\n\n"
-        f"<i>TVL \u2022 Volume \u2022 Fees: DefiLlama on-chain data\n"
-        f"Markets \u2022 Creators \u2022 Users: Rain Protocol API\n"
+        f"<i>TVL \u2022 Volume \u2022 Fees: DefiLlama (on-chain)\n"
+        f"Markets \u2022 Users: Rain Protocol API\n"
         f"Updated {now.strftime('%H:%M UTC')}</i>"
     )
     return text
@@ -1482,7 +1475,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ---- Protocol Data time-range buttons ----
         elif data.startswith("pdata:"):
             time_range = data.split(":", 1)[1]
-            if time_range not in ("24h", "30d", "month", "all"):
+            if time_range not in ("24h", "7d", "30d", "all"):
                 time_range = "month"
             await query.edit_message_text(
                 text="\u23f3 Fetching protocol statistics\u2026", parse_mode="HTML"
