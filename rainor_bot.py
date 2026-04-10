@@ -276,6 +276,60 @@ async def fetch_all_pools_count() -> int:
         return 0
 
 
+async def fetch_platform_tvl() -> float:
+    """Fetch current platform TVL from Rain API /investments/platform-tvl.
+
+    Returns raw value divided by 1e6 to get USD amount.
+    Returns 0.0 on failure.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        def _sync_fetch():
+            s = _get_cloudscraper()
+            r = s.get(f"{RAIN_API_BASE}/investments/platform-tvl", timeout=15)
+            r.raise_for_status()
+            raw = r.json().get("data", {}).get("tvl", 0)
+            return float(raw) / 1_000_000
+        return await loop.run_in_executor(None, _sync_fetch)
+    except Exception as exc:
+        logger.error("fetch_platform_tvl failed: %s", exc)
+        return 0.0
+
+
+async def fetch_rain_burned() -> float:
+    """Fetch total RAIN tokens burned from Rain API /rain-token/total-burned.
+
+    Returns the totalBurned float (in RAIN tokens). Returns 0.0 on failure.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        def _sync_fetch():
+            s = _get_cloudscraper()
+            r = s.get(f"{RAIN_API_BASE}/rain-token/total-burned", timeout=15)
+            r.raise_for_status()
+            return float(r.json().get("details", {}).get("totalBurned", 0))
+        return await loop.run_in_executor(None, _sync_fetch)
+    except Exception as exc:
+        logger.error("fetch_rain_burned failed: %s", exc)
+        return 0.0
+
+
+async def fetch_rain_price() -> float:
+    """Fetch current RAIN token price in USD from CoinGecko.
+
+    Returns price as float. Returns 0.0 on failure.
+    """
+    url = "https://api.coingecko.com/api/v3/simple/price?ids=rain-coin&vs_currencies=usd"
+    try:
+        client = await get_http_client()
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return float(resp.json().get("rain-coin", {}).get("usd", 0))
+    except Exception as exc:
+        logger.error("fetch_rain_price failed: %s", exc)
+        return 0.0
+
+
 async def fetch_pool_detail(pool_id: str) -> dict | None:
     """Fetch full details for a single pool by its ID."""
     url = f"{RAIN_API_BASE}/pools/pool/{pool_id}"
@@ -1254,43 +1308,26 @@ def _protocoldata_keyboard(active_range: str = "month") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([buttons[:2], buttons[2:]])
 
 
-async def _build_protocol_data_text(time_range: str = "month") -> str:
-    """Build the /protocoldata response text for the given time range.
+def _fmt_rain(tokens: float) -> str:
+    """Format a RAIN token amount compactly (e.g. 1,234 or 12.3K or 1.23M)."""
+    if tokens >= 1_000_000:
+        return f"{tokens / 1_000_000:.2f}M"
+    if tokens >= 1_000:
+        return f"{tokens / 1_000:.1f}K"
+    return f"{tokens:,.0f}"
 
-    Supported ranges: '24h', '7d', '30d', 'all'.
-    Default view is current calendar month.
-    Uses DefiLlama API for TVL, Volume, and Fees (authoritative on-chain data).
-    Uses Rain Protocol API for market counts.
+
+async def _fetch_markets_in_range(cutoff: datetime | None) -> list[dict]:
+    """Fetch all public pools created on or after `cutoff`.
+
+    If cutoff is None (All Time), returns all markets (up to 2000).
+    Returns a list of pool dicts.
     """
-    now = datetime.now(timezone.utc)
-
-    # Determine the cutoff datetime based on the requested range
-    if time_range == "24h":
-        cutoff = now - timedelta(hours=24)
-        period_label = "Last 24 Hours"
-        period_range = f"{cutoff.strftime('%b %d %H:%M')} \u2013 {now.strftime('%b %d %H:%M UTC')}"
-    elif time_range == "7d":
-        cutoff = now - timedelta(days=7)
-        period_label = "Last 7 Days"
-        period_range = f"{cutoff.strftime('%b %d')} \u2013 {now.strftime('%b %d, %Y')}"
-    elif time_range == "30d":
-        cutoff = now - timedelta(days=30)
-        period_label = "Last 30 Days"
-        period_range = f"{cutoff.strftime('%b %d')} \u2013 {now.strftime('%b %d, %Y')}"
-    elif time_range == "all":
-        cutoff = None
-        period_label = "All Time"
-        period_range = f"Since inception \u2013 {now.strftime('%b %d, %Y')}"
-    else:  # "month" — current calendar month (default)
-        cutoff = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        period_label = now.strftime("%B %Y")
-        period_range = f"{cutoff.strftime('%b %d')} \u2013 {now.strftime('%b %d, %Y')}"
-
-    # --- Collect markets in the time range (from Rain API) ---
-    matched_markets: list[dict] = []
+    matched: list[dict] = []
     page = 1
+    max_pages = 25  # safety cap (25 * 100 = 2500 markets)
 
-    while page <= 20:
+    while page <= max_pages:
         pools = await fetch_public_pools(limit=100, offset=page, sort_by="age")
         if not pools:
             break
@@ -1304,89 +1341,136 @@ async def _build_protocol_data_text(time_range: str = "month") -> str:
             if cutoff is not None and created_dt < cutoff:
                 found_older = True
                 break
-            matched_markets.append(p)
+            matched.append(p)
         if found_older or len(pools) < 100:
             break
         page += 1
 
-    # --- Total markets on protocol (always all-time, from Rain API) ---
-    total_count = await fetch_all_pools_count()
+    return matched
+
+
+async def _build_protocol_data_text(time_range: str = "month") -> str:
+    """Build the /protocoldata response text for the given time range.
+
+    Supported ranges: '24h', '7d', '30d', 'all'.
+    Default view is current calendar month.
+
+    Data sources:
+    - TVL: Rain API /investments/platform-tvl (raw / 1e6 = USD)
+    - Volume: DefiLlama /summary/dexs/rain (total24h/7d/30d/AllTime)
+    - Fees: 2.5% of volume (calculated)
+    - RAIN burned: Rain API /rain-token/total-burned (details.totalBurned)
+    - RAIN price: CoinGecko /simple/price?ids=rain-coin
+    - Users: Rain API /users/users-total-count
+    - Markets (all time): Rain API /pools/get-all-pools-count
+    - Markets (period): Rain API /pools/public-pools filtered by createdAt
+    """
+    now = datetime.now(timezone.utc)
+
+    # Determine the cutoff datetime based on the requested range
+    if time_range == "24h":
+        cutoff = now - timedelta(hours=24)
+        period_label = "Last 24 Hours"
+        period_range = f"{cutoff.strftime('%b %d %H:%M')} \u2013 {now.strftime('%b %d %H:%M UTC')}"
+        vol_key = "total24h"
+    elif time_range == "7d":
+        cutoff = now - timedelta(days=7)
+        period_label = "Last 7 Days"
+        period_range = f"{cutoff.strftime('%b %d')} \u2013 {now.strftime('%b %d, %Y')}"
+        vol_key = "total7d"
+    elif time_range == "30d":
+        cutoff = now - timedelta(days=30)
+        period_label = "Last 30 Days"
+        period_range = f"{cutoff.strftime('%b %d')} \u2013 {now.strftime('%b %d, %Y')}"
+        vol_key = "total30d"
+    elif time_range == "all":
+        cutoff = None
+        period_label = "All Time"
+        period_range = f"Since inception \u2013 {now.strftime('%b %d, %Y')}"
+        vol_key = "totalAllTime"
+    else:  # "month" \u2014 current calendar month (default)
+        cutoff = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        period_label = now.strftime("%B %Y")
+        period_range = f"{cutoff.strftime('%b %d')} \u2013 {now.strftime('%b %d, %Y')}"
+        vol_key = "total30d"  # DefiLlama has no calendar-month bucket; use rolling 30d
+
+    # --- Run all API calls concurrently ---
+    (
+        markets_task,
+        total_count_task,
+        total_users_task,
+        tvl_task,
+        rain_burned_task,
+        rain_price_task,
+    ) = await asyncio.gather(
+        _fetch_markets_in_range(cutoff),
+        fetch_all_pools_count(),
+        fetch_total_users(),
+        fetch_platform_tvl(),
+        fetch_rain_burned(),
+        fetch_rain_price(),
+        return_exceptions=True,
+    )
+
+    # Unpack results safely (replace exceptions with defaults)
+    matched_markets: list[dict] = markets_task if isinstance(markets_task, list) else []
+    total_count: int = total_count_task if isinstance(total_count_task, int) and total_count_task > 0 else 0
+    total_users: int = total_users_task if isinstance(total_users_task, int) else 0
+    tvl_usd: float = tvl_task if isinstance(tvl_task, float) else 0.0
+    rain_burned: float = rain_burned_task if isinstance(rain_burned_task, float) else 0.0
+    rain_price: float = rain_price_task if isinstance(rain_price_task, float) else 0.0
+
+    # Fallback for total_count
     if total_count == 0:
         total_count = await fetch_pool_count()
 
-    # --- Total registered users (all-time, from Rain API) ---
-    total_users = await fetch_total_users()
-
-    # --- Fetch TVL, Volume, and Fees from DefiLlama API ---
-    dl_tvl = 0.0
+    # --- Fetch volume from DefiLlama ---
     dl_volume = 0.0
-    dl_fees = 0.0
-
     try:
         async with httpx.AsyncClient(timeout=15.0) as dl_client:
-            # TVL: current on-chain snapshot (always live, regardless of time range)
-            tvl_resp = await dl_client.get("https://api.llama.fi/tvl/rain")
-            if tvl_resp.status_code == 200:
-                dl_tvl = float(tvl_resp.json())
-
-            # Volume: from DefiLlama DEX adapter
             vol_resp = await dl_client.get("https://api.llama.fi/summary/dexs/rain")
             if vol_resp.status_code == 200:
-                vol_data = vol_resp.json()
-                if time_range == "24h":
-                    dl_volume = float(vol_data.get("total24h") or 0)
-                elif time_range == "7d":
-                    dl_volume = float(vol_data.get("total7d") or 0)
-                elif time_range == "30d":
-                    dl_volume = float(vol_data.get("total30d") or 0)
-                elif time_range == "all":
-                    dl_volume = float(vol_data.get("totalAllTime") or 0)
-                else:  # "month"
-                    dl_volume = float(vol_data.get("total30d") or 0)
-
-            # Fees: from DefiLlama fees adapter
-            fees_resp = await dl_client.get("https://api.llama.fi/summary/fees/rain")
-            if fees_resp.status_code == 200:
-                fees_data = fees_resp.json()
-                if time_range == "24h":
-                    dl_fees = float(fees_data.get("total24h") or 0)
-                elif time_range == "7d":
-                    dl_fees = float(fees_data.get("total7d") or 0)
-                elif time_range == "30d":
-                    dl_fees = float(fees_data.get("total30d") or 0)
-                elif time_range == "all":
-                    dl_fees = float(fees_data.get("totalAllTime") or 0)
-                else:  # "month"
-                    dl_fees = float(fees_data.get("total30d") or 0)
+                dl_volume = float(vol_resp.json().get(vol_key) or 0)
     except Exception as exc:
-        logger.warning("DefiLlama API error in /protocoldata: %s", exc)
+        logger.warning("DefiLlama volume fetch failed: %s", exc)
 
-    # Fees fallback: estimate as 2.5% of volume if DefiLlama fees returned 0
-    fee_usd = dl_fees if dl_fees > 0 else dl_volume * 0.025
+    # --- Fees: always 2.5% of volume (per spec) ---
+    fee_usd = dl_volume * 0.025
 
-    # Volume label note for "month" range
+    # --- RAIN tokens equivalent of fees ---
+    # fee_usd / rain_price = RAIN tokens burned from this period's fees
+    if rain_price > 0 and fee_usd > 0:
+        fee_rain_tokens = fee_usd / rain_price
+        fee_rain_str = f" (~{_fmt_rain(fee_rain_tokens)} RAIN)"
+    else:
+        fee_rain_str = ""
+
+    # --- Format RAIN burned (all time) ---
+    burned_str = f"{rain_burned / 1_000_000:.2f}M" if rain_burned >= 1_000_000 else f"{rain_burned:,.0f}"
+
+    # --- Volume note for month range ---
     vol_note = " (rolling 30d)" if time_range == "month" else ""
 
-    # Users line: always show total users (it's always all-time)
-    users_line = ""
-    if total_users > 0:
-        users_line = f"\U0001f464 <b>Total users (all time):</b> {total_users:,}\n"
-
-    # Build the message
-    text = (
-        f"\U0001f4ca <b>Rain Protocol \u2014 {period_label}</b>\n\n"
-        f"\U0001f4c5 <b>Period:</b> {period_range}\n\n"
-        f"\U0001f195 <b>Markets opened:</b> {len(matched_markets)}\n"
-        f"\U0001f4b0 <b>Volume{vol_note}:</b> ${dl_volume:,.0f}\n"
-        f"\U0001f512 <b>TVL (current):</b> ${dl_tvl:,.0f}\n"
-        f"\U0001f525 <b>Fees{vol_note} (\u2192 Rain burn):</b> ${fee_usd:,.0f}\n\n"
-        f"{users_line}"
-        f"\U0001f30d <b>Total markets (all time):</b> {total_count:,}\n\n"
-        f"<i>TVL \u2022 Volume \u2022 Fees: DefiLlama (on-chain)\n"
-        f"Markets \u2022 Users: Rain Protocol API\n"
-        f"Updated {now.strftime('%H:%M UTC')}</i>"
-    )
-    return text
+    # --- Build the message ---
+    lines = [
+        f"\U0001f4ca <b>Rain Protocol \u2014 {period_label}</b>",
+        "",
+        f"\U0001f4c5 <b>Period:</b> {period_range}",
+        "",
+        f"\U0001f195 <b>Markets opened:</b> {len(matched_markets)}",
+        f"\U0001f4b0 <b>Volume{vol_note}:</b> ${dl_volume:,.0f}",
+        f"\U0001f512 <b>TVL (current):</b> ${tvl_usd:,.0f}",
+        f"\U0001f525 <b>Fees{vol_note} (\u2192 Rain burn):</b> ${fee_usd:,.0f}{fee_rain_str}",
+        "",
+        f"\U0001f4a7 <b>Total RAIN burned (all time):</b> {burned_str}",
+        f"\U0001f464 <b>Total users (all time):</b> {total_users:,}",
+        f"\U0001f30d <b>Total markets (all time):</b> {total_count:,}",
+        "",
+        f"<i>TVL \u2022 RAIN burned \u2022 Users \u2022 Markets: Rain API",
+        f"Volume: DefiLlama (on-chain) | Fees: 2.5% of volume",
+        f"Updated {now.strftime('%H:%M UTC')}</i>",
+    ]
+    return "\n".join(lines)
 
 
 async def cmd_protocoldata(update: Update, context: ContextTypes.DEFAULT_TYPE):
