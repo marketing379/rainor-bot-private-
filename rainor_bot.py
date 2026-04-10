@@ -1264,22 +1264,32 @@ async def _build_protocol_data_text(time_range: str = "month") -> str:
     # --- Fetch DefiLlama data (TVL, Volume, Fees) ---
     dl = await _fetch_defillama_data()
 
-    # Map time_range to the right DefiLlama bucket
+    # Map time_range to the right DefiLlama bucket for Volume and Fees
+    vol_label = "Volume"
+    fees_label = "Fees (\u2192 Rain burn)"
     if time_range == "24h":
         vol_usd = dl.get("vol_24h", 0)
         fees_usd = dl.get("fees_24h", 0)
-    elif time_range == "30d" or time_range == "month":
+    elif time_range == "30d":
         vol_usd = dl.get("vol_30d", 0)
         fees_usd = dl.get("fees_30d", 0)
+    elif time_range == "month":
+        # DefiLlama doesn't have calendar-month buckets; use 30d as approximation
+        vol_usd = dl.get("vol_30d", 0)
+        fees_usd = dl.get("fees_30d", 0)
+        vol_label = "Volume (rolling 30d)"
+        fees_label = "Fees (rolling 30d, \u2192 Rain burn)"
     else:  # all
         vol_usd = dl.get("vol_all", 0)
         fees_usd = dl.get("fees_all", 0)
 
+    # TVL is always a current snapshot — same regardless of time range
     tvl_usd = dl.get("tvl", 0)
 
     # --- Collect markets in the time range (from Rain API) ---
+    # Also collect unique wallet addresses (poolOwnerWalletAddress) as "new users"
     matched_markets: list[dict] = []
-    unique_creators: set[str] = set()
+    unique_wallets: set[str] = set()
     page = 1
 
     while page <= 20:  # safety limit
@@ -1300,8 +1310,9 @@ async def _build_protocol_data_text(time_range: str = "month") -> str:
                 break
 
             matched_markets.append(p)
-            creator = p.get("poolOwnerName") or p.get("poolOwnerAddress") or "unknown"
-            unique_creators.add(creator)
+            wallet = p.get("poolOwnerWalletAddress") or p.get("poolOwnerAddress") or ""
+            if wallet:
+                unique_wallets.add(wallet.lower())
 
         if found_older or len(pools) < 100:
             break
@@ -1309,11 +1320,6 @@ async def _build_protocol_data_text(time_range: str = "month") -> str:
 
     # --- Total markets on protocol (always all-time) ---
     total_count = await fetch_pool_count()
-
-    # --- Volume note for month view ---
-    vol_note = ""
-    if time_range == "month":
-        vol_note = " (rolling 30d)"
 
     # --- Source labels ---
     dl_ok = bool(dl)
@@ -1323,10 +1329,10 @@ async def _build_protocol_data_text(time_range: str = "month") -> str:
         f"\U0001f4ca <b>Rain Protocol \u2014 {period_label}</b>\n\n"
         f"\U0001f4c5 <b>Period:</b> {period_range}\n\n"
         f"\U0001f195 <b>Markets opened:</b> {len(matched_markets)}\n"
-        f"\U0001f465 <b>Unique creators:</b> {len(unique_creators)}\n"
-        f"\U0001f4b0 <b>Volume{vol_note}:</b> ${vol_usd:,.0f}\n"
-        f"\U0001f512 <b>TVL (Total Value Locked):</b> ${tvl_usd:,.0f}\n"
-        f"\U0001f525 <b>Fees (protocol revenue):</b> ${fees_usd:,.0f}\n\n"
+        f"\U0001f465 <b>New users (wallets):</b> {len(unique_wallets)}\n"
+        f"\U0001f4b0 <b>{vol_label}:</b> ${vol_usd:,.0f}\n"
+        f"\U0001f512 <b>TVL (current):</b> ${tvl_usd:,.0f}\n"
+        f"\U0001f525 <b>{fees_label}:</b> ${fees_usd:,.0f}\n\n"
         f"\U0001f30d <b>Total markets (all time):</b> {total_count:,}\n\n"
         f"<i>Data: {source_label} \u2022 {now.strftime('%H:%M UTC')}</i>"
     )

@@ -1,17 +1,16 @@
 nohup: ignoring input
-2026-04-10 15:59:50,246 [INFO] rainor — Starting Rainor bot…
-2026-04-10 15:59:50,495 [INFO] rainor — Handlers registered. Starting polling…
-2026-04-10 15:59:53,578 [INFO] httpx — HTTP Request: POST https://api.telegram.org/bot8778171032:AAHs-UG8DVwaxY7lhwkTsfPoNXvYiPb2kgI/getMe "HTTP/1.1 200 OK"
-2026-04-10 15:59:53,579 [INFO] apscheduler.scheduler — Scheduler started
-2026-04-10 15:59:53,580 [INFO] telegram.ext.Application — Application started
-2026-04-10 15:59:53,580 [INFO] rainor — Background market polling task launched.
-2026-04-10 15:59:53,580 [INFO] rainor — Background market end-time alert task launched.
-2026-04-10 15:59:53,581 [INFO] rainor — Market polling loop started (interval=30s)
-2026-04-10 15:59:53,581 [INFO] rainor — Market end-time alert loop started (interval=300s)
-2026-04-10 15:59:54,527 [INFO] httpx — HTTP Request: POST https://api.telegram.org/bot8778171032:AAHs-UG8DVwaxY7lhwkTsfPoNXvYiPb2kgI/deleteWebhook "HTTP/1.1 200 OK"
-2026-04-10 15:59:54,528 [INFO] rainor — Telegram update polling started. Bot is live!
-2026-04-10 16:00:07,534 [INFO] httpx — HTTP Request: POST https://api.telegram.org/bot8778171032:AAHs-UG8DVwaxY7lhwkTsfPoNXvYiPb2kgI/getUpdates "HTTP/1.1 200 OK"
-2026-04-10 16:00:18,556 [INFO] httpx — HTTP Request: POST https://api.telegram.org/bot8778171032:AAHs-UG8DVwaxY7lhwkTsfPoNXvYiPb2kgI/getUpdates "HTTP/1.1 200 OK"
-2026-04-10 16:00:29,498 [INFO] httpx — HTTP Request: POST https://api.telegram.org/bot8778171032:AAHs-UG8DVwaxY7lhwkTsfPoNXvYiPb2kgI/getUpdates "HTTP/1.1 200 OK"
+2026-04-10 16:04:15,887 [INFO] rainor — Starting Rainor bot…
+2026-04-10 16:04:16,216 [INFO] rainor — Handlers registered. Starting polling…
+2026-04-10 16:04:16,861 [INFO] httpx — HTTP Request: POST https://api.telegram.org/bot8778171032:AAHs-UG8DVwaxY7lhwkTsfPoNXvYiPb2kgI/getMe "HTTP/1.1 200 OK"
+2026-04-10 16:04:16,863 [INFO] apscheduler.scheduler — Scheduler started
+2026-04-10 16:04:16,863 [INFO] telegram.ext.Application — Application started
+2026-04-10 16:04:16,864 [INFO] rainor — Background market polling task launched.
+2026-04-10 16:04:16,864 [INFO] rainor — Background market end-time alert task launched.
+2026-04-10 16:04:16,865 [INFO] rainor — Market polling loop started (interval=30s)
+2026-04-10 16:04:16,866 [INFO] rainor — Market end-time alert loop started (interval=300s)
+2026-04-10 16:04:17,069 [INFO] httpx — HTTP Request: POST https://api.telegram.org/bot8778171032:AAHs-UG8DVwaxY7lhwkTsfPoNXvYiPb2kgI/deleteWebhook "HTTP/1.1 200 OK"
+2026-04-10 16:04:17,071 [INFO] rainor — Telegram update polling started. Bot is live!
+2026-04-10 16:04:27,690 [INFO] httpx — HTTP Request: POST https://api.telegram.org/bot8778171032:AAHs-UG8DVwaxY7lhwkTsfPoNXvYiPb2kgI/getUpdates "HTTP/1.1 200 OK"
+2026-04-10 16:04:37,902 [INFO] httpx — HTTP Request: POST https://api.telegram.org/bot8778171032:AAHs-UG8DVwaxY7lhwkTsfPoNXvYiPb2kgI/getUpdates "HTTP/1.1 200 OK"
 K"
-2026-04-10 16:00:29,498 [INFO] httpx — HTTP Request: POST https://api.telegram.org/bot8778171032:AAHs-UG8DVwaxY7lhwkTsfPoNXvYiPb2kgI/getUpdates "HTTP/1.1 200 OK"
+2026-04-10 16:04:37,902 [INFO] httpx — HTTP Request: POST https://api.telegram.org/bot8778171032:AAHs-UG8DVwaxY7lhwkTsfPoNXvYiPb2kgI/getUpdates "HTTP/1.1 200 OK"
