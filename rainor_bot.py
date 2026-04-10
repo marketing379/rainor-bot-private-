@@ -1178,19 +1178,59 @@ async def cmd_closing(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---- /protocoldata ----
 
-async def _build_protocol_data_text() -> str:
-    """Build the /protocoldata response text with monthly protocol statistics.
+def _protocoldata_keyboard(active_range: str = "month") -> InlineKeyboardMarkup:
+    """Return inline keyboard with time-range buttons for /protocoldata.
 
+    The currently active range button gets a checkmark prefix.
+    """
+    ranges = [
+        ("24h", "24 Hours"),
+        ("30d", "30 Days"),
+        ("month", "Current Month"),
+        ("all", "All Time"),
+    ]
+    buttons = []
+    for key, label in ranges:
+        prefix = "\u2705 " if key == active_range else ""
+        buttons.append(
+            InlineKeyboardButton(
+                f"{prefix}{label}",
+                callback_data=f"pdata:{key}",
+            )
+        )
+    return InlineKeyboardMarkup([buttons[:2], buttons[2:]])
+
+
+async def _build_protocol_data_text(time_range: str = "month") -> str:
+    """Build the /protocoldata response text for the given time range.
+
+    Supported ranges: '24h', '30d', 'month', 'all'.
     Calculates metrics from the public-pools endpoint since there is no
     dedicated protocol stats API.
     """
     now = datetime.now(timezone.utc)
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    month_label = now.strftime("%B %Y")
 
-    # --- Markets opened this month + volume this month ---
-    markets_this_month: list[dict] = []
-    monthly_volume = 0
+    # Determine the cutoff datetime based on the requested range
+    if time_range == "24h":
+        cutoff = now - timedelta(hours=24)
+        period_label = "Last 24 Hours"
+        period_range = f"{cutoff.strftime('%b %d %H:%M')} \u2013 {now.strftime('%b %d %H:%M UTC')}"
+    elif time_range == "30d":
+        cutoff = now - timedelta(days=30)
+        period_label = "Last 30 Days"
+        period_range = f"{cutoff.strftime('%b %d')} \u2013 {now.strftime('%b %d, %Y')}"
+    elif time_range == "all":
+        cutoff = None  # No cutoff — include everything
+        period_label = "All Time"
+        period_range = f"Since inception \u2013 {now.strftime('%b %d, %Y')}"
+    else:  # "month" — current calendar month
+        cutoff = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        period_label = now.strftime("%B %Y")
+        period_range = f"{cutoff.strftime('%b %d')} \u2013 {now.strftime('%b %d, %Y')}"
+
+    # --- Collect markets in the time range + volume ---
+    matched_markets: list[dict] = []
+    total_volume = 0
     unique_creators: set[str] = set()
     page = 1
 
@@ -1207,13 +1247,13 @@ async def _build_protocol_data_text() -> str:
             except Exception:
                 continue
 
-            if created_dt < month_start:
+            if cutoff is not None and created_dt < cutoff:
                 found_older = True
                 break
 
-            markets_this_month.append(p)
+            matched_markets.append(p)
             vol = p.get("totalVolumeUSD", 0) or 0
-            monthly_volume += vol
+            total_volume += vol
             creator = p.get("poolOwnerName") or p.get("poolOwnerAddress") or "unknown"
             unique_creators.add(creator)
 
@@ -1221,7 +1261,7 @@ async def _build_protocol_data_text() -> str:
             break
         page += 1
 
-    # --- TVL: sum of totalLiquidity for all Live markets ---
+    # --- TVL: sum of totalLiquidity for all Live markets (always current) ---
     tvl = 0
     tvl_page = 1
     while tvl_page <= 10:
@@ -1234,22 +1274,22 @@ async def _build_protocol_data_text() -> str:
             break
         tvl_page += 1
 
-    # --- Total markets on protocol ---
+    # --- Total markets on protocol (always all-time) ---
     total_count = await fetch_pool_count()
 
-    # --- Fee = 2.5% of monthly volume ---
-    fee = monthly_volume * 0.025
+    # --- Fee = 2.5% of volume in the selected period ---
+    fee = total_volume * 0.025
 
     # Convert from micro-units to USD
-    vol_usd = monthly_volume / 1_000_000
+    vol_usd = total_volume / 1_000_000
     tvl_usd = tvl / 1_000_000
     fee_usd = fee / 1_000_000
 
     text = (
-        f"\U0001f4ca <b>Rain Protocol \u2014 {month_label} Statistics</b>\n\n"
-        f"\U0001f4c5 <b>Period:</b> {month_start.strftime('%b %d')} \u2013 {now.strftime('%b %d, %Y')}\n\n"
-        f"\U0001f195 <b>Markets opened:</b> {len(markets_this_month)}\n"
-        f"\U0001f465 <b>New creators:</b> {len(unique_creators)}\n"
+        f"\U0001f4ca <b>Rain Protocol \u2014 {period_label}</b>\n\n"
+        f"\U0001f4c5 <b>Period:</b> {period_range}\n\n"
+        f"\U0001f195 <b>Markets opened:</b> {len(matched_markets)}\n"
+        f"\U0001f465 <b>Unique creators:</b> {len(unique_creators)}\n"
         f"\U0001f4b0 <b>Volume:</b> ${vol_usd:,.2f}\n"
         f"\U0001f512 <b>TVL (Total Value Locked):</b> ${tvl_usd:,.2f}\n"
         f"\U0001f525 <b>Fee (2.5% \u2192 Rain burn):</b> ${fee_usd:,.2f}\n\n"
@@ -1260,11 +1300,11 @@ async def _build_protocol_data_text() -> str:
 
 
 async def cmd_protocoldata(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /protocoldata \u2014 show monthly protocol statistics."""
+    """Handle /protocoldata \u2014 show protocol statistics (default: current month)."""
     try:
         await update.message.reply_text("\u23f3 Fetching protocol statistics\u2026")
-        text = await _build_protocol_data_text()
-        keyboard = refresh_keyboard("protocoldata")
+        text = await _build_protocol_data_text("month")
+        keyboard = _protocoldata_keyboard("month")
         await update.message.reply_text(
             text, parse_mode="HTML", reply_markup=keyboard,
             disable_web_page_preview=True,
@@ -1321,28 +1361,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         text, reply_markup=keyboard,
                     )
 
-            elif command == "protocoldata":
-                await query.edit_message_text(
-                    text="\u23f3 Refreshing\u2026", parse_mode="HTML"
-                )
-                text = await _build_protocol_data_text()
-                keyboard = refresh_keyboard("protocoldata")
-                if len(text) <= 4096:
-                    await query.edit_message_text(
-                        text=text, parse_mode="HTML",
-                        reply_markup=keyboard,
-                        disable_web_page_preview=True,
-                    )
-                else:
-                    try:
-                        await query.message.delete()
-                    except Exception:
-                        pass
-                    await send_chunked(
-                        (context.bot, query.message.chat_id),
-                        text, reply_markup=keyboard,
-                    )
-
             elif command == "closing":
                 try:
                     await query.message.delete()
@@ -1363,6 +1381,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             else:
                 await query.edit_message_text(text="Unknown command.")
+
+        # ---- Protocol Data time-range buttons ----
+        elif data.startswith("pdata:"):
+            time_range = data.split(":", 1)[1]
+            if time_range not in ("24h", "30d", "month", "all"):
+                time_range = "month"
+            await query.edit_message_text(
+                text="\u23f3 Fetching protocol statistics\u2026", parse_mode="HTML"
+            )
+            text = await _build_protocol_data_text(time_range)
+            keyboard = _protocoldata_keyboard(time_range)
+            if len(text) <= 4096:
+                await query.edit_message_text(
+                    text=text, parse_mode="HTML",
+                    reply_markup=keyboard,
+                    disable_web_page_preview=True,
+                )
+            else:
+                try:
+                    await query.message.delete()
+                except Exception:
+                    pass
+                await send_chunked(
+                    (context.bot, query.message.chat_id),
+                    text, reply_markup=keyboard,
+                )
 
         # ---- Show More button (pagination for /latest) ----
         elif data.startswith("showmore:"):
