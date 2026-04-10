@@ -5,7 +5,7 @@ Rainor Bot — Real-time Rain Protocol Market Monitor for Telegram.
 Monitors the Rain Protocol production API for newly created prediction markets
 and sends instant Telegram notifications to the admin.
 
-Bot Token: 8778171032:AAHs-UG8DVwaxY7lhwkTsfPoNXvYiPb2kgI
+Bot Token: 8652656523:AAFHhZ4KVLu1H3tYcmQ_Y5OAQbbWAUs8nik
 API Source: https://prod-api.rain.one/pools/public-pools
 """
 
@@ -33,7 +33,7 @@ from telegram.ext import (
 # Configuration
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = "8778171032:AAHs-UG8DVwaxY7lhwkTsfPoNXvYiPb2kgI"
+BOT_TOKEN = "8652656523:AAFHhZ4KVLu1H3tYcmQ_Y5OAQbbWAUs8nik"
 RAIN_API_BASE = "https://prod-api.rain.one"
 MARKET_URL_TEMPLATE = "https://www.rain.one/detail?id={pool_id}"
 DATA_DIR = Path(__file__).resolve().parent
