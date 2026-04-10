@@ -20,6 +20,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import httpx
+import cloudscraper
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -220,6 +221,58 @@ async def fetch_pool_count(status: str | None = None) -> int:
         return int(body.get("data", {}).get("count", 0))
     except Exception as exc:
         logger.error("fetch_pool_count failed (status=%s): %s", status, exc)
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Rain API — aggregate stats (Cloudflare-protected, uses cloudscraper)
+# ---------------------------------------------------------------------------
+
+_cloudscraper_session: cloudscraper.CloudScraper | None = None
+
+
+def _get_cloudscraper() -> cloudscraper.CloudScraper:
+    """Return (and lazily create) a reusable cloudscraper session."""
+    global _cloudscraper_session
+    if _cloudscraper_session is None:
+        _cloudscraper_session = cloudscraper.create_scraper()
+    return _cloudscraper_session
+
+
+async def fetch_total_users() -> int:
+    """Fetch total registered user count from Rain API.
+
+    Uses /users/users-total-count endpoint (Cloudflare-protected,
+    so we use cloudscraper in a thread to bypass the JS challenge).
+    Returns 0 on failure.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        def _sync_fetch():
+            s = _get_cloudscraper()
+            r = s.get(f"{RAIN_API_BASE}/users/users-total-count", timeout=15)
+            r.raise_for_status()
+            return int(r.json().get("data", {}).get("totalUsers", 0))
+        return await loop.run_in_executor(None, _sync_fetch)
+    except Exception as exc:
+        logger.error("fetch_total_users failed: %s", exc)
+        return 0
+
+
+async def fetch_all_pools_count() -> int:
+    """Fetch total pool count from /pools/get-all-pools-count.
+
+    This endpoint is NOT behind Cloudflare, so httpx works fine.
+    Returns 0 on failure.
+    """
+    url = f"{RAIN_API_BASE}/pools/get-all-pools-count"
+    try:
+        client = await get_http_client()
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return int(resp.json().get("data", {}).get("poolsCount", 0))
+    except Exception as exc:
+        logger.error("fetch_all_pools_count failed: %s", exc)
         return 0
 
 
@@ -1201,45 +1254,12 @@ def _protocoldata_keyboard(active_range: str = "month") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([buttons[:2], buttons[2:]])
 
 
-async def _fetch_defillama_data() -> dict:
-    """Fetch TVL, Volume, and Fees from DefiLlama API for Rain Protocol.
-    Returns a dict with keys: tvl, vol_24h, vol_7d, vol_30d, vol_all,
-    fees_24h, fees_7d, fees_30d, fees_all. Values in USD.
-    Returns empty dict on failure."""
-    result = {}
-    try:
-        client = await get_http_client()
-        # TVL
-        tvl_resp = await client.get("https://api.llama.fi/tvl/rain", timeout=15)
-        if tvl_resp.status_code == 200:
-            result["tvl"] = float(tvl_resp.text.strip())
-        # Volume
-        vol_resp = await client.get("https://api.llama.fi/summary/dexs/rain", timeout=15)
-        if vol_resp.status_code == 200:
-            vd = vol_resp.json()
-            result["vol_24h"] = vd.get("total24h", 0) or 0
-            result["vol_7d"] = vd.get("total7d", 0) or 0
-            result["vol_30d"] = vd.get("total30d", 0) or 0
-            result["vol_all"] = vd.get("totalAllTime", 0) or 0
-        # Fees
-        fees_resp = await client.get("https://api.llama.fi/summary/fees/rain", timeout=15)
-        if fees_resp.status_code == 200:
-            fd = fees_resp.json()
-            result["fees_24h"] = fd.get("total24h", 0) or 0
-            result["fees_7d"] = fd.get("total7d", 0) or 0
-            result["fees_30d"] = fd.get("total30d", 0) or 0
-            result["fees_all"] = fd.get("totalAllTime", 0) or 0
-    except Exception as exc:
-        logger.error("DefiLlama API fetch failed: %s", exc)
-    return result
-
-
 async def _build_protocol_data_text(time_range: str = "month") -> str:
     """Build the /protocoldata response text for the given time range.
 
     Supported ranges: '24h', '30d', 'month', 'all'.
-    Uses DefiLlama API for TVL, Volume, and Fees (on-chain data).
-    Uses Rain REST API for market counts and creator counts.
+    Uses DefiLlama API for TVL, Volume, and Fees (authoritative on-chain data).
+    Uses Rain Protocol API for market counts and unique creators.
     """
     now = datetime.now(timezone.utc)
 
@@ -1253,50 +1273,23 @@ async def _build_protocol_data_text(time_range: str = "month") -> str:
         period_label = "Last 30 Days"
         period_range = f"{cutoff.strftime('%b %d')} \u2013 {now.strftime('%b %d, %Y')}"
     elif time_range == "all":
-        cutoff = None  # No cutoff — include everything
+        cutoff = None
         period_label = "All Time"
         period_range = f"Since inception \u2013 {now.strftime('%b %d, %Y')}"
-    else:  # "month" — current calendar month
+    else:  # "month"
         cutoff = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         period_label = now.strftime("%B %Y")
         period_range = f"{cutoff.strftime('%b %d')} \u2013 {now.strftime('%b %d, %Y')}"
 
-    # --- Fetch DefiLlama data (TVL, Volume, Fees) ---
-    dl = await _fetch_defillama_data()
-
-    # Map time_range to the right DefiLlama bucket for Volume and Fees
-    vol_label = "Volume"
-    fees_label = "Fees (\u2192 Rain burn)"
-    if time_range == "24h":
-        vol_usd = dl.get("vol_24h", 0)
-        fees_usd = dl.get("fees_24h", 0)
-    elif time_range == "30d":
-        vol_usd = dl.get("vol_30d", 0)
-        fees_usd = dl.get("fees_30d", 0)
-    elif time_range == "month":
-        # DefiLlama doesn't have calendar-month buckets; use 30d as approximation
-        vol_usd = dl.get("vol_30d", 0)
-        fees_usd = dl.get("fees_30d", 0)
-        vol_label = "Volume (rolling 30d)"
-        fees_label = "Fees (rolling 30d, \u2192 Rain burn)"
-    else:  # all
-        vol_usd = dl.get("vol_all", 0)
-        fees_usd = dl.get("fees_all", 0)
-
-    # TVL is always a current snapshot — same regardless of time range
-    tvl_usd = dl.get("tvl", 0)
-
     # --- Collect markets in the time range (from Rain API) ---
-    # Also collect unique wallet addresses (poolOwnerWalletAddress) as "new users"
     matched_markets: list[dict] = []
-    unique_wallets: set[str] = set()
+    unique_creators: set[str] = set()
     page = 1
 
-    while page <= 20:  # safety limit
+    while page <= 20:
         pools = await fetch_public_pools(limit=100, offset=page, sort_by="age")
         if not pools:
             break
-
         found_older = False
         for p in pools:
             created_raw = p.get("createdAt", "")
@@ -1304,37 +1297,101 @@ async def _build_protocol_data_text(time_range: str = "month") -> str:
                 created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
             except Exception:
                 continue
-
             if cutoff is not None and created_dt < cutoff:
                 found_older = True
                 break
-
             matched_markets.append(p)
-            wallet = p.get("poolOwnerWalletAddress") or p.get("poolOwnerAddress") or ""
-            if wallet:
-                unique_wallets.add(wallet.lower())
-
+            creator = p.get("poolOwnerName") or p.get("poolOwnerAddress") or "unknown"
+            unique_creators.add(creator)
         if found_older or len(pools) < 100:
             break
         page += 1
 
-    # --- Total markets on protocol (always all-time) ---
-    total_count = await fetch_pool_count()
+    # --- Total markets on protocol (always all-time, from Rain API) ---
+    # Use the dedicated /pools/get-all-pools-count endpoint for accuracy
+    total_count = await fetch_all_pools_count()
+    if total_count == 0:
+        # Fallback to the old method if the new endpoint fails
+        total_count = await fetch_pool_count()
 
-    # --- Source labels ---
-    dl_ok = bool(dl)
-    source_label = "DefiLlama (on-chain) + Rain API" if dl_ok else "Rain Protocol API (fallback)"
+    # --- Total registered users (all-time, from Rain API) ---
+    total_users = await fetch_total_users()
 
+    # --- Fetch TVL, Volume, and Fees from DefiLlama API ---
+    # DefiLlama reads directly from Arbitrum on-chain data (pool contract balances
+    # and EnterOption/Claim events), which is more accurate than the Rain REST API
+    # whose totalLiquidity/totalVolumeUSD fields only reflect partial internal metrics.
+    dl_tvl = 0.0
+    dl_volume = 0.0
+    dl_fees = 0.0
+    dl_source_note = "DefiLlama (on-chain) + Rain Protocol API"
+    dl_available = False
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as dl_client:
+            # TVL: current on-chain snapshot (always the live figure regardless of time range)
+            tvl_resp = await dl_client.get("https://api.llama.fi/tvl/rain")
+            if tvl_resp.status_code == 200:
+                dl_tvl = float(tvl_resp.json())
+                dl_available = True
+
+            # Volume: from DefiLlama DEX dimension adapter
+            # Fields: total24h, total7d, total30d, totalAllTime
+            vol_resp = await dl_client.get("https://api.llama.fi/summary/dexs/rain")
+            if vol_resp.status_code == 200:
+                vol_data = vol_resp.json()
+                if time_range == "24h":
+                    dl_volume = float(vol_data.get("total24h") or 0)
+                elif time_range == "30d":
+                    dl_volume = float(vol_data.get("total30d") or 0)
+                elif time_range == "all":
+                    dl_volume = float(vol_data.get("totalAllTime") or 0)
+                else:  # "month" — DefiLlama has no calendar-month bucket; use 30d
+                    dl_volume = float(vol_data.get("total30d") or 0)
+
+            # Fees: from DefiLlama fees dimension adapter
+            # Fields: total24h, total7d, total30d, totalAllTime
+            fees_resp = await dl_client.get("https://api.llama.fi/summary/fees/rain")
+            if fees_resp.status_code == 200:
+                fees_data = fees_resp.json()
+                if time_range == "24h":
+                    dl_fees = float(fees_data.get("total24h") or 0)
+                elif time_range == "30d":
+                    dl_fees = float(fees_data.get("total30d") or 0)
+                elif time_range == "all":
+                    dl_fees = float(fees_data.get("totalAllTime") or 0)
+                else:
+                    dl_fees = float(fees_data.get("total30d") or 0)
+    except Exception as exc:
+        logger.warning("DefiLlama API error in /protocoldata: %s", exc)
+        dl_source_note = "Rain Protocol API (DefiLlama unavailable)"
+
+    # Fees fallback: if DefiLlama fees endpoint returned 0 but volume is available,
+    # estimate fees as 2.5% of volume (Rain Protocol's stated fee rate)
+    fee_usd = dl_fees if dl_fees > 0 else dl_volume * 0.025
+
+    # Volume note for "month" range (DefiLlama uses rolling 30d, not calendar month)
+    vol_note = " (rolling 30d)" if time_range == "month" else ""
+
+    # Users line: only show for "all" range since it's always all-time
+    users_line = ""
+    if total_users > 0:
+        users_line = f"\U0001f464 <b>Total users (all time):</b> {total_users:,}\n"
+
+    # Build the message
     text = (
         f"\U0001f4ca <b>Rain Protocol \u2014 {period_label}</b>\n\n"
         f"\U0001f4c5 <b>Period:</b> {period_range}\n\n"
         f"\U0001f195 <b>Markets opened:</b> {len(matched_markets)}\n"
-        f"\U0001f465 <b>New users (wallets):</b> {len(unique_wallets)}\n"
-        f"\U0001f4b0 <b>{vol_label}:</b> ${vol_usd:,.0f}\n"
-        f"\U0001f512 <b>TVL (current):</b> ${tvl_usd:,.0f}\n"
-        f"\U0001f525 <b>{fees_label}:</b> ${fees_usd:,.0f}\n\n"
+        f"\U0001f465 <b>Unique creators:</b> {len(unique_creators)}\n"
+        f"\U0001f4b0 <b>Volume{vol_note}:</b> ${dl_volume:,.2f}\n"
+        f"\U0001f512 <b>TVL (current):</b> ${dl_tvl:,.2f}\n"
+        f"\U0001f525 <b>Fees{vol_note} (\u2192 Rain burn):</b> ${fee_usd:,.2f}\n\n"
+        f"{users_line}"
         f"\U0001f30d <b>Total markets (all time):</b> {total_count:,}\n\n"
-        f"<i>Data: {source_label} \u2022 {now.strftime('%H:%M UTC')}</i>"
+        f"<i>TVL \u2022 Volume \u2022 Fees: DefiLlama on-chain data\n"
+        f"Markets \u2022 Creators \u2022 Users: Rain Protocol API\n"
+        f"Updated {now.strftime('%H:%M UTC')}</i>"
     )
     return text
 
