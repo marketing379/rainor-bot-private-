@@ -1450,11 +1450,81 @@ async def cmd_pendingclose(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Send header
         header = (
             f"\u23f0 <b>Markets Pending Close \u2014 {len(pending)} found</b>\n\n"
-            f"These markets have passed their end time but are not yet closed."
+            f"These markets have passed their end time but are not yet closed.\n"
+            f"Showing first example below. Use /pendingcloseall to see all."
         )
         await update.message.reply_text(header, parse_mode="HTML")
 
-        # Send each market as a separate message with Close + View buttons
+        # Send only the FIRST market as an example
+        p = pending[0]
+        pool_id = p.get("_id", "")
+        question = p.get("question", "Unknown market")
+        status_val = p.get("status", "Unknown")
+        end_str = format_end_date(p.get("endDate"))
+        creator = get_creator_display(p)
+
+        # Calculate how overdue
+        try:
+            end_dt = datetime.fromisoformat(p["endDate"].replace("Z", "+00:00"))
+            overdue = datetime.now(timezone.utc) - end_dt
+            days = overdue.days
+            hours = overdue.seconds // 3600
+            if days > 0:
+                overdue_str = f"{days}d {hours}h overdue"
+            else:
+                overdue_str = f"{hours}h overdue"
+        except Exception:
+            overdue_str = "overdue"
+
+        text = (
+            f"<b>1/{len(pending)}.</b> {question}\n"
+            f"   <b>End date:</b> {end_str}\n"
+            f"   <b>Status:</b> {status_val} ({overdue_str})\n"
+            f"   <b>Creator:</b> {creator}"
+        )
+
+        keyboard = _pendingclose_keyboard(pool_id)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=keyboard,
+        )
+
+    except Exception as exc:
+        logger.error("cmd_pendingclose failed: %s", exc, exc_info=True)
+        try:
+            await update.message.reply_text(
+                "Sorry, an error occurred while fetching pending-close markets. Please try again."
+            )
+        except Exception:
+            pass
+
+
+async def cmd_pendingcloseall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /pendingcloseall — show ALL markets past their end time that need closing."""
+    try:
+        await update.message.reply_text(
+            "\u23f3 Fetching all markets pending close\u2026"
+        )
+
+        pending = await _fetch_pending_close_markets()
+
+        if not pending:
+            await update.message.reply_text(
+                "\u2705 No markets are currently pending close. "
+                "All ended markets have been closed.",
+                parse_mode="HTML",
+            )
+            return
+
+        header = (
+            f"\u23f0 <b>Markets Pending Close \u2014 {len(pending)} found</b>\n\n"
+            f"Sending all markets below (with 0.5s delay between each to avoid flooding)."
+        )
+        await update.message.reply_text(header, parse_mode="HTML")
+
         for i, p in enumerate(pending, 1):
             pool_id = p.get("_id", "")
             question = p.get("question", "Unknown market")
@@ -1462,7 +1532,6 @@ async def cmd_pendingclose(update: Update, context: ContextTypes.DEFAULT_TYPE):
             end_str = format_end_date(p.get("endDate"))
             creator = get_creator_display(p)
 
-            # Calculate how overdue
             try:
                 end_dt = datetime.fromisoformat(p["endDate"].replace("Z", "+00:00"))
                 overdue = datetime.now(timezone.utc) - end_dt
@@ -1476,7 +1545,7 @@ async def cmd_pendingclose(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 overdue_str = "overdue"
 
             text = (
-                f"<b>{i}.</b> {question}\n"
+                f"<b>{i}/{len(pending)}.</b> {question}\n"
                 f"   <b>End date:</b> {end_str}\n"
                 f"   <b>Status:</b> {status_val} ({overdue_str})\n"
                 f"   <b>Creator:</b> {creator}"
@@ -1490,12 +1559,14 @@ async def cmd_pendingclose(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True,
                 reply_markup=keyboard,
             )
+            # Rate limit to avoid Telegram flood
+            await asyncio.sleep(0.5)
 
     except Exception as exc:
-        logger.error("cmd_pendingclose failed: %s", exc, exc_info=True)
+        logger.error("cmd_pendingcloseall failed: %s", exc, exc_info=True)
         try:
             await update.message.reply_text(
-                "Sorry, an error occurred while fetching pending-close markets. Please try again."
+                "Sorry, an error occurred. Please try again."
             )
         except Exception:
             pass
@@ -2198,7 +2269,8 @@ async def post_init(app: Application):
         BotCommand("status", "Show market counts by status and top volume"),
         BotCommand("latest", "Show 5 most recent active markets"),
         BotCommand("closing", "List markets closing in the next 48 hours"),
-        BotCommand("pendingclose", "Markets past end time awaiting close"),
+        BotCommand("pendingclose", "Markets past end time awaiting close (1 example)"),
+        BotCommand("pendingcloseall", "All markets past end time awaiting close"),
         BotCommand("protocoldata", "Monthly protocol statistics"),
         BotCommand("help", "Show available commands"),
     ])
@@ -2244,6 +2316,7 @@ async def run_bot():
     app.add_handler(CommandHandler("latest", cmd_latest))
     app.add_handler(CommandHandler("closing", cmd_closing))
     app.add_handler(CommandHandler("pendingclose", cmd_pendingclose))
+    app.add_handler(CommandHandler("pendingcloseall", cmd_pendingcloseall))
     app.add_handler(CommandHandler("protocoldata", cmd_protocoldata))
 
     # Register the callback query handler for ALL inline buttons
