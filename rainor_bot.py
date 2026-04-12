@@ -413,7 +413,8 @@ async def fetch_active_pools_paginated(
 
 # ---------------------------------------------------------------------------
 # Blockchain helpers — close market on-chain via web3
-# --------------------------------------------------------------------------def _close_market_blocking(contract_address: str) -> tuple[bool, str]:
+# --------------------------------------------------------------------------
+def _close_market_blocking(contract_address: str) -> tuple[bool, str]:
     """Blocking helper: connect to Arbitrum and call closePool().
     Must be run in a thread executor to avoid blocking the event loop.
     """
@@ -1754,13 +1755,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     disable_web_page_preview=True,
                 )
             except Exception:
-                # If edit fails (e.g., message too long), send as new message
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=answer_text,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
+                # If edit fails (e.g., HTML parse error), try without parse_mode
+                try:
+                    await thinking_msg.edit_text(
+                        answer_text,
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    await context.bot.send_message(
+                        chat_id=query.message.chat_id,
+                        text=answer_text,
+                        disable_web_page_preview=True,
+                    )
 
         else:
             logger.warning("Unknown callback data: %s", data)
