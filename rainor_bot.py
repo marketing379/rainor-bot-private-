@@ -471,6 +471,10 @@ def _close_market_blocking(contract_address: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
+# A set of pool_ids for which a close operation has been cancelled
+_close_cancelled: set[str] = set()
+
+
 async def close_market_on_chain(pool_id: str) -> tuple[bool, str]:
     """
     Close a market by calling closePool() on its smart contract.
@@ -480,7 +484,6 @@ async def close_market_on_chain(pool_id: str) -> tuple[bool, str]:
     Returns (success: bool, message: str).
     """
     try:
-        # Step 1: Get the market's contract address from the API (async)
         detail = await fetch_pool_detail(pool_id)
         if not detail:
             return False, "Could not fetch market details from Rain API."
@@ -493,66 +496,139 @@ async def close_market_on_chain(pool_id: str) -> tuple[bool, str]:
         if market_status == "Closed":
             return False, "Market is already closed."
 
-        # Step 2: Run all blocking web3 calls in a thread executor
         loop = asyncio.get_running_loop()
         success, msg = await loop.run_in_executor(
             None, _close_market_blocking, contract_address
         )
         return success, msg
-        # Step 3: Set up the account
-        pk = PRIVATE_KEY if PRIVATE_KEY.startswith("0x") else f"0x{PRIVATE_KEY}"
-        account = Account.from_key(pk)
-        sender = account.address
-
-        # Step 4: Build the closePool() transaction
-        contract = w3.eth.contract(
-            address=Web3.to_checksum_address(contract_address),
-            abi=CLOSE_POOL_ABI,
-        )
-
-        nonce = w3.eth.get_transaction_count(sender)
-        gas_price = w3.eth.gas_price
-
-        tx = contract.functions.closePool().build_transaction({
-            "from": sender,
-            "nonce": nonce,
-            "gas": 300_000,  # generous gas limit for safety
-            "gasPrice": gas_price,
-            "chainId": ARBITRUM_CHAIN_ID,
-            "value": 0,
-        })
-
-        # Step 5: Sign and send
-        signed_tx = w3.eth.account.sign_transaction(tx, private_key=pk)
-        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-        tx_hash_hex = tx_hash.hex()
-
-        logger.info(
-            "closePool tx sent for market %s — tx hash: %s", pool_id, tx_hash_hex
-        )
-
-        # Step 6: Wait for receipt (with timeout)
-        try:
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-            if receipt.status == 1:
-                return True, (
-                    f"Market closed on-chain.\n"
-                    f"TX: https://arbiscan.io/tx/0x{tx_hash_hex}"
-                )
-            else:
-                return False, (
-                    f"Transaction reverted.\n"
-                    f"TX: https://arbiscan.io/tx/0x{tx_hash_hex}"
-                )
-        except Exception as wait_err:
-            return False, (
-                f"Transaction sent but receipt not confirmed: {wait_err}\n"
-                f"TX: https://arbiscan.io/tx/0x{tx_hash_hex}"
-            )
 
     except Exception as exc:
         logger.error("close_market_on_chain failed for %s: %s", pool_id, exc, exc_info=True)
         return False, f"Error: {exc}"
+
+
+async def close_market_with_progress(
+    pool_id: str,
+    progress_msg,
+    original_msg,
+    bot,
+    chat_id: int,
+) -> None:
+    """Close a market on-chain with detailed progress updates.
+
+    *progress_msg* is the Telegram message object to edit with status updates.
+    *original_msg* is the market message to delete on success.
+    Supports cancellation via _close_cancelled set.
+    """
+    try:
+        # Step 1: Fetch market details
+        await progress_msg.edit_text(
+            "\u23f3 <b>Step 1/4:</b> Fetching market details\u2026",
+            parse_mode="HTML",
+        )
+        detail = await fetch_pool_detail(pool_id)
+        if not detail:
+            await progress_msg.edit_text(
+                "\u274c <b>Failed:</b> Could not fetch market details from Rain API.",
+                parse_mode="HTML",
+                reply_markup=close_market_keyboard(pool_id),
+            )
+            return
+
+        contract_address = detail.get("contractAddress")
+        if not contract_address:
+            await progress_msg.edit_text(
+                "\u274c <b>Failed:</b> Market has no contract address.",
+                parse_mode="HTML",
+                reply_markup=close_market_keyboard(pool_id),
+            )
+            return
+
+        market_status = detail.get("status", "")
+        if market_status == "Closed":
+            await progress_msg.edit_text(
+                "\u2139\ufe0f Market is already closed.",
+                parse_mode="HTML",
+            )
+            return
+
+        # Check cancel
+        if pool_id in _close_cancelled:
+            _close_cancelled.discard(pool_id)
+            await progress_msg.edit_text(
+                "\u270b <b>Cancelled</b> \u2014 close operation aborted by user.",
+                parse_mode="HTML",
+            )
+            return
+
+        # Step 2: Connecting to blockchain
+        await progress_msg.edit_text(
+            f"\u23f3 <b>Step 2/4:</b> Connecting to Arbitrum blockchain\u2026\n"
+            f"Contract: <code>{contract_address[:10]}\u2026{contract_address[-6:]}</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\u274c Cancel", callback_data=f"cancelclose:{pool_id}")]
+            ]),
+        )
+
+        # Check cancel again
+        await asyncio.sleep(0.5)
+        if pool_id in _close_cancelled:
+            _close_cancelled.discard(pool_id)
+            await progress_msg.edit_text(
+                "\u270b <b>Cancelled</b> \u2014 close operation aborted by user.",
+                parse_mode="HTML",
+            )
+            return
+
+        # Step 3: Sending transaction
+        await progress_msg.edit_text(
+            "\u23f3 <b>Step 3/4:</b> Building and sending closePool() transaction\u2026\n"
+            "<i>This may take 10\u201360 seconds.</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\u274c Cancel", callback_data=f"cancelclose:{pool_id}")]
+            ]),
+        )
+
+        # Run the blocking web3 call
+        loop = asyncio.get_running_loop()
+        success, result_msg = await loop.run_in_executor(
+            None, _close_market_blocking, contract_address
+        )
+
+        # Step 4: Result
+        if success:
+            await progress_msg.edit_text(
+                f"\u2705 <b>Step 4/4: Market closed successfully!</b>\n\n{result_msg}",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            # Delete the original market message
+            try:
+                await original_msg.delete()
+                logger.info("Deleted original market message for pool %s", pool_id)
+            except Exception as del_err:
+                logger.warning("Could not delete market message for %s: %s", pool_id, del_err)
+        else:
+            await progress_msg.edit_text(
+                f"\u274c <b>Failed to close market</b>\n\n"
+                f"<b>Reason:</b> {result_msg}",
+                parse_mode="HTML",
+                reply_markup=close_market_keyboard(pool_id),
+                disable_web_page_preview=True,
+            )
+
+    except Exception as exc:
+        logger.error("close_market_with_progress failed for %s: %s", pool_id, exc, exc_info=True)
+        try:
+            await progress_msg.edit_text(
+                f"\u274c <b>Unexpected error:</b> {exc}",
+                parse_mode="HTML",
+                reply_markup=close_market_keyboard(pool_id),
+            )
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -717,13 +793,26 @@ def get_creator_display(pool: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def market_buttons(pool_id: str) -> InlineKeyboardMarkup:
-    """Return a 3-row InlineKeyboardMarkup for a market:
-    Row 1: [🌐 Market] [⛔ Close]
-    Row 2: [💧 Add Liquidity] [📊 Data]
-    Row 3: [🔍 Check Answer]
+CLOSED_STATUSES = {"Closed"}
+
+
+def market_buttons(pool_id: str, status: str | None = None) -> InlineKeyboardMarkup:
+    """Return an InlineKeyboardMarkup for a market.
+
+    For closed markets (status in CLOSED_STATUSES), only show a Link button.
+    For active markets, show the full action button set.
     """
     url = MARKET_URL_TEMPLATE.format(pool_id=pool_id)
+
+    if status and status in CLOSED_STATUSES:
+        # Closed markets: only show link + status label
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("\U0001f310 View on Rain", url=url),
+            ],
+        ])
+
+    # Active markets: full button set
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("\U0001f310 Market", url=url),
@@ -826,9 +915,9 @@ async def send_chunked(
             )
 
 
-async def send_market_with_buttons(bot, chat_id: int, text: str, pool_id: str):
+async def send_market_with_buttons(bot, chat_id: int, text: str, pool_id: str, status: str | None = None):
     """Send a market message with its per-market button row."""
-    keyboard = market_buttons(pool_id)
+    keyboard = market_buttons(pool_id, status=status)
     await bot.send_message(
         chat_id=chat_id,
         text=text,
@@ -839,12 +928,12 @@ async def send_market_with_buttons(bot, chat_id: int, text: str, pool_id: str):
 
 
 async def send_multi_market_messages(
-    target, header: str, market_entries: list[tuple[str, str]],
+    target, header: str, market_entries: list[tuple],
     footer_markup=None,
 ):
     """Send a header message, then one message per market with its own button row.
 
-    *market_entries* is a list of (text, pool_id) tuples.
+    *market_entries* is a list of (text, pool_id) or (text, pool_id, status) tuples.
     *footer_markup* is an optional InlineKeyboardMarkup for a final button.
     *target* is either an Update.message or a tuple (bot, chat_id).
     """
@@ -863,8 +952,10 @@ async def send_multi_market_messages(
     )
 
     # Send each market as a separate message with its own button row
-    for text, pool_id in market_entries:
-        keyboard = market_buttons(pool_id)
+    for entry in market_entries:
+        text, pool_id = entry[0], entry[1]
+        status = entry[2] if len(entry) > 2 else None
+        keyboard = market_buttons(pool_id, status=status)
         await bot.send_message(
             chat_id=chat_id,
             text=text,
@@ -1035,6 +1126,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/status \u2014 Show market counts by status and top markets by volume\n"
             "/latest \u2014 Show the 5 most recent active markets\n"
             "/closing \u2014 List markets closing in the next 48 hours\n"
+            "/pendingclose \u2014 Markets past end time awaiting close\n"
             "/protocoldata \u2014 Monthly protocol statistics (volume, TVL, fees)\n"
             "/help \u2014 Show this help message\n\n"
             "<b>Per-market buttons:</b>\n"
@@ -1279,6 +1371,131 @@ async def cmd_closing(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await update.message.reply_text(
                 "Sorry, an error occurred while fetching closing markets. Please try again."
+            )
+        except Exception:
+            pass
+
+
+# ---- /pendingclose ----
+
+async def _fetch_pending_close_markets() -> list[dict]:
+    """Fetch all non-Closed markets whose endDate has passed.
+
+    Returns a list of pool dicts sorted by endDate (oldest first).
+    """
+    now = datetime.now(timezone.utc)
+    pending: list[dict] = []
+
+    for status in ACTIVE_STATUSES:
+        page = 1
+        while True:
+            pools = await fetch_public_pools(
+                limit=100, offset=page, sort_by="age", status=status
+            )
+            if not pools:
+                break
+            for p in pools:
+                end_raw = p.get("endDate")
+                if not end_raw:
+                    continue
+                try:
+                    end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                if end_dt <= now:
+                    pending.append(p)
+            if len(pools) < 100:
+                break
+            page += 1
+
+    # Sort by endDate ascending (oldest overdue first)
+    def _sort_key(p: dict):
+        try:
+            return datetime.fromisoformat(p["endDate"].replace("Z", "+00:00"))
+        except Exception:
+            return datetime.max.replace(tzinfo=timezone.utc)
+
+    pending.sort(key=_sort_key)
+    return pending
+
+
+def _pendingclose_keyboard(pool_id: str) -> InlineKeyboardMarkup:
+    """Return a keyboard with Close + View buttons for a pending-close market."""
+    url = MARKET_URL_TEMPLATE.format(pool_id=pool_id)
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("\u26d4 Close Market", callback_data=f"close:{pool_id}"),
+            InlineKeyboardButton("\U0001f310 View", url=url),
+        ],
+    ])
+
+
+async def cmd_pendingclose(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /pendingclose — show markets past their end time that need closing."""
+    try:
+        await update.message.reply_text(
+            "\u23f3 Fetching markets pending close\u2026"
+        )
+
+        pending = await _fetch_pending_close_markets()
+
+        if not pending:
+            await update.message.reply_text(
+                "\u2705 No markets are currently pending close. "
+                "All ended markets have been closed.",
+                parse_mode="HTML",
+            )
+            return
+
+        # Send header
+        header = (
+            f"\u23f0 <b>Markets Pending Close \u2014 {len(pending)} found</b>\n\n"
+            f"These markets have passed their end time but are not yet closed."
+        )
+        await update.message.reply_text(header, parse_mode="HTML")
+
+        # Send each market as a separate message with Close + View buttons
+        for i, p in enumerate(pending, 1):
+            pool_id = p.get("_id", "")
+            question = p.get("question", "Unknown market")
+            status_val = p.get("status", "Unknown")
+            end_str = format_end_date(p.get("endDate"))
+            creator = get_creator_display(p)
+
+            # Calculate how overdue
+            try:
+                end_dt = datetime.fromisoformat(p["endDate"].replace("Z", "+00:00"))
+                overdue = datetime.now(timezone.utc) - end_dt
+                days = overdue.days
+                hours = overdue.seconds // 3600
+                if days > 0:
+                    overdue_str = f"{days}d {hours}h overdue"
+                else:
+                    overdue_str = f"{hours}h overdue"
+            except Exception:
+                overdue_str = "overdue"
+
+            text = (
+                f"<b>{i}.</b> {question}\n"
+                f"   <b>End date:</b> {end_str}\n"
+                f"   <b>Status:</b> {status_val} ({overdue_str})\n"
+                f"   <b>Creator:</b> {creator}"
+            )
+
+            keyboard = _pendingclose_keyboard(pool_id)
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=keyboard,
+            )
+
+    except Exception as exc:
+        logger.error("cmd_pendingclose failed: %s", exc, exc_info=True)
+        try:
+            await update.message.reply_text(
+                "Sorry, an error occurred while fetching pending-close markets. Please try again."
             )
         except Exception:
             pass
@@ -1612,6 +1829,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ---- Close Market button ----
         elif data.startswith("close:"):
             pool_id = data.split(":", 1)[1]
+            original_msg = query.message  # The market message with buttons
 
             # Remove buttons from the original message to prevent double-clicks
             try:
@@ -1619,31 +1837,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            await context.bot.send_message(
+            # Send a progress message that will be updated step-by-step
+            progress_msg = await context.bot.send_message(
                 chat_id=query.message.chat_id,
-                text=f"\u23f3 Closing market <code>{pool_id}</code>\u2026 Please wait.",
+                text=f"\u23f3 <b>Closing market</b> <code>{pool_id[:12]}\u2026</code>\n"
+                     f"Starting close process\u2026",
                 parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("\u274c Cancel", callback_data=f"cancelclose:{pool_id}")]
+                ]),
             )
 
-            success, result_msg = await close_market_on_chain(pool_id)
+            # Run the close with progress updates (handles success/failure internally)
+            await close_market_with_progress(
+                pool_id, progress_msg, original_msg, context.bot, query.message.chat_id
+            )
 
-            if success:
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=f"\u2705 <b>Market closed successfully</b>\n\n{result_msg}",
+        # ---- Cancel Close button ----
+        elif data.startswith("cancelclose:"):
+            pool_id = data.split(":", 1)[1]
+            _close_cancelled.add(pool_id)
+            try:
+                await query.edit_message_text(
+                    "\u270b <b>Cancelling\u2026</b> The close will be aborted if the "
+                    "transaction hasn't been sent yet.",
                     parse_mode="HTML",
-                    disable_web_page_preview=True,
                 )
-            else:
-                # Re-add the Close button so the admin can retry
-                keyboard = close_market_keyboard(pool_id)
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=f"\u274c <b>Failed to close market</b>\n\n{result_msg}",
-                    parse_mode="HTML",
-                    reply_markup=keyboard,
-                    disable_web_page_preview=True,
-                )
+            except Exception:
+                pass
 
         # ---- Add Liquidity button (coming soon) ----
         elif data.startswith("liquidity:"):
@@ -1707,7 +1928,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             # Send as a new message with the market buttons
-            keyboard = market_buttons(pool_id)
+            keyboard = market_buttons(pool_id, status=status_val)
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
                 text=data_text,
@@ -1899,7 +2120,8 @@ async def poll_ended_markets(app: Application):
 
                         # Build and send the alert with per-market buttons
                         msg = build_ended_alert_text(p)
-                        keyboard = market_buttons(pool_id)
+                        pool_status = p.get("status", "")
+                        keyboard = market_buttons(pool_id, status=pool_status)
 
                         try:
                             await app.bot.send_message(
@@ -1976,6 +2198,7 @@ async def post_init(app: Application):
         BotCommand("status", "Show market counts by status and top volume"),
         BotCommand("latest", "Show 5 most recent active markets"),
         BotCommand("closing", "List markets closing in the next 48 hours"),
+        BotCommand("pendingclose", "Markets past end time awaiting close"),
         BotCommand("protocoldata", "Monthly protocol statistics"),
         BotCommand("help", "Show available commands"),
     ])
@@ -2020,6 +2243,7 @@ async def run_bot():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("latest", cmd_latest))
     app.add_handler(CommandHandler("closing", cmd_closing))
+    app.add_handler(CommandHandler("pendingclose", cmd_pendingclose))
     app.add_handler(CommandHandler("protocoldata", cmd_protocoldata))
 
     # Register the callback query handler for ALL inline buttons
